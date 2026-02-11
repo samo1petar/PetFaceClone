@@ -1,6 +1,8 @@
 import argparse
 import logging
 import os
+import shutil
+import json
 
 import numpy as np
 import torch
@@ -50,6 +52,12 @@ def main(args):
 
     os.makedirs(cfg.output, exist_ok=True)
     init_logging(rank, cfg.output)
+
+    # Save config file and args for reproducibility (only on rank 0)
+    if rank == 0:
+        shutil.copy(args.config, os.path.join(cfg.output, os.path.basename(args.config)))
+        with open(os.path.join(cfg.output, "args.json"), "w") as f:
+            json.dump(vars(args), f, indent=4)
 
     summary_writer = (
         SummaryWriter(log_dir=os.path.join(cfg.output, "tensorboard"))
