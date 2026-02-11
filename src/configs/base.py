@@ -45,6 +45,14 @@ config.gradient_acc = 1
 # setup seed
 config.seed = 2048
 
+# Stepwise LR scheduler (kicks in after step_lr_after_epoch)
+# Set step_lr_after_epoch to None or 0 to disable
+config.step_lr_after_epoch = 13
+config.step_size = 5  # step every N epochs
+config.step_gamma = 0.1  # multiply LR by this value at each step
+# step_lr_start: "initial" (use cfg.lr), "current" (use PolyScheduler LR at switch), or a float value
+config.step_lr_start = "current"
+
 # dataload numworkers
 config.num_workers = 4
 

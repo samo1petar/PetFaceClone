@@ -14,6 +14,7 @@ from backbones import get_model
 from dataset import get_dataloader
 from losses import CombinedMarginLoss
 from lr_scheduler import PolyScheduler
+from torch.optim.lr_scheduler import StepLR
 from partial_fc import PartialFC, PartialFCAdamW
 from utils.utils_callbacks import CallBackLogging, CallBackVerification
 from utils.utils_config import get_config
@@ -131,6 +132,10 @@ def main(args):
         last_epoch=-1
     )
 
+    # StepLR scheduler will be created lazily when switching from PolyScheduler
+    step_lr_scheduler = None
+    step_lr_initialized = False
+
     start_epoch = 0
     global_step = 0
     if cfg.resume:
@@ -141,6 +146,15 @@ def main(args):
         module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
         lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
+        if "state_step_lr_scheduler" in dict_checkpoint:
+            # Recreate StepLR scheduler and load its state
+            step_lr_scheduler = StepLR(
+                optimizer=opt,
+                step_size=cfg.step_size,
+                gamma=cfg.step_gamma
+            )
+            step_lr_scheduler.load_state_dict(dict_checkpoint["state_step_lr_scheduler"])
+            step_lr_initialized = True
         del dict_checkpoint
 
     for key, value in cfg.items():
@@ -162,6 +176,30 @@ def main(args):
     amp = torch.cuda.amp.grad_scaler.GradScaler(growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
+        print(f'Epoch {epoch + 1} / {cfg.num_epoch}')
+        # Initialize StepLR scheduler when switching from PolyScheduler
+        use_step_lr = cfg.step_lr_after_epoch and epoch >= cfg.step_lr_after_epoch
+        if use_step_lr and not step_lr_initialized:
+            # Determine starting LR based on config
+            if cfg.step_lr_start == "initial":
+                start_lr = cfg.lr
+            elif cfg.step_lr_start == "current":
+                start_lr = opt.param_groups[0]['lr']
+            else:
+                # Assume it's a float value
+                start_lr = float(cfg.step_lr_start)
+
+            # Set optimizer LR before creating StepLR
+            for param_group in opt.param_groups:
+                param_group['lr'] = start_lr
+
+            step_lr_scheduler = StepLR(
+                optimizer=opt,
+                step_size=cfg.step_size,
+                gamma=cfg.step_gamma
+            )
+            step_lr_initialized = True
+            logging.info(f"Switched to StepLR at epoch {epoch} with starting LR: {start_lr}")
 
         if isinstance(train_loader, DataLoader):
             train_loader.sampler.set_epoch(epoch)
@@ -182,14 +220,21 @@ def main(args):
                 torch.nn.utils.clip_grad_norm_(backbone.parameters(), 5)
                 opt.step()
 
-            lr_scheduler.step()
+            # Use PolyScheduler (per-batch) until step_lr_after_epoch, then use StepLR (per-epoch)
+            if not use_step_lr:
+                lr_scheduler.step()
 
+            current_lr = opt.param_groups[0]['lr']
             with torch.no_grad():
                 loss_am.update(loss.item(), 1)
-                callback_logging(global_step, loss_am, epoch, cfg.fp16, lr_scheduler.get_last_lr()[0], amp)
+                callback_logging(global_step, loss_am, epoch, cfg.fp16, current_lr, amp)
 
                 # if global_step % cfg.verbose == 0 and global_step > 0:
                 #     callback_verification(global_step, backbone)
+
+        # Step the StepLR scheduler at the end of each epoch (if active)
+        if use_step_lr and step_lr_scheduler is not None:
+            step_lr_scheduler.step()
 
         if cfg.save_all_states:
             checkpoint = {
@@ -200,6 +245,8 @@ def main(args):
                 "state_optimizer": opt.state_dict(),
                 "state_lr_scheduler": lr_scheduler.state_dict()
             }
+            if step_lr_scheduler is not None:
+                checkpoint["state_step_lr_scheduler"] = step_lr_scheduler.state_dict()
             torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
 
         if False:#rank == 0 and (epoch+1)%20==0:
