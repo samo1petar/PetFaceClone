@@ -19,7 +19,7 @@ class CallBackVerification(object):
         self.highest_acc_list: List[float] = [0.0] * len(val_targets)
         self.ver_list: List[object] = []
         self.ver_name_list: List[str] = []
-        if self.rank is 0:
+        if self.rank == 0:
             self.init_dataset(val_targets=val_targets, data_dir=rec_prefix)
 
         self.summary_writer = summary_writer
@@ -51,7 +51,7 @@ class CallBackVerification(object):
                 self.ver_name_list.append(name)
 
     def __call__(self, num_update, backbone: torch.nn.Module):
-        if self.rank is 0 and num_update > 0:
+        if self.rank == 0 and num_update > 0:
             backbone.eval()
             self.ver_test(backbone, num_update)
             backbone.train()
@@ -77,7 +77,7 @@ class CallBackLogging(object):
                  epoch: int,
                  fp16: bool,
                  learning_rate: float,
-                 grad_scaler: torch.cuda.amp.GradScaler):
+                 grad_scaler: torch.amp.GradScaler):
         if self.rank == 0 and global_step > 0 and global_step % self.frequent == 0:
             if self.init:
                 try:

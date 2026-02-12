@@ -134,7 +134,7 @@ def main(args):
     start_epoch = 0
     global_step = 0
     if cfg.resume:
-        dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
+        dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"), weights_only=False)
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
         backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
@@ -159,7 +159,7 @@ def main(args):
     )
 
     loss_am = AverageMeter()
-    amp = torch.cuda.amp.grad_scaler.GradScaler(growth_interval=100)
+    amp = torch.amp.GradScaler('cuda', growth_interval=100)
 
     for epoch in range(start_epoch, cfg.num_epoch):
 

@@ -201,7 +201,7 @@ class PartialFC(torch.nn.Module):
         if self.sample_rate < 1:
             self.sample(labels, index_positive, optimizer)
 
-        with torch.cuda.amp.autocast(self.fp16):
+        with torch.amp.autocast('cuda', enabled=self.fp16):
             norm_embeddings = normalize(embeddings)
             norm_weight_activated = normalize(self.weight_activated)
             logits = linear(norm_embeddings, norm_weight_activated)
@@ -214,13 +214,13 @@ class PartialFC(torch.nn.Module):
         return loss
 
     def state_dict(self, destination=None, prefix="", keep_vars=False):
-        if destination is None: 
+        if destination is None:
             destination = collections.OrderedDict()
             destination._metadata = collections.OrderedDict()
 
         for name, module in self._modules.items():
             if module is not None:
-                module.state_dict(destination, prefix + name + ".", keep_vars=keep_vars)
+                module.state_dict(destination=destination, prefix=prefix + name + ".", keep_vars=keep_vars)
         if self.sample_rate < 1:
             destination["weight"] = self.weight.detach()
         else:
@@ -401,7 +401,7 @@ class PartialFCAdamW(torch.nn.Module):
         if self.sample_rate < 1:
             self.sample(labels, index_positive, optimizer)
 
-        with torch.cuda.amp.autocast(self.fp16):
+        with torch.amp.autocast('cuda', enabled=self.fp16):
             norm_embeddings = normalize(embeddings)
             norm_weight_activated = normalize(self.weight_activated)
             logits = linear(norm_embeddings, norm_weight_activated)
@@ -419,7 +419,7 @@ class PartialFCAdamW(torch.nn.Module):
 
         for name, module in self._modules.items():
             if module is not None:
-                module.state_dict(destination, prefix + name + ".", keep_vars=keep_vars)
+                module.state_dict(destination=destination, prefix=prefix + name + ".", keep_vars=keep_vars)
         if self.sample_rate < 1:
             destination["weight"] = self.weight.detach()
         else:

@@ -341,7 +341,7 @@ def main():
         optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=1e-4)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.fp16)
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -357,7 +357,7 @@ def main():
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=args.fp16):
+            with torch.amp.autocast('cuda', enabled=args.fp16):
                 embeddings = backbone(images)
                 loss = criterion(embeddings, labels)
 
