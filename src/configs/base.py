@@ -58,3 +58,6 @@ config.num_workers = 4
 
 # common image dir
 config.basedir='data/PetFace/images'
+
+# validation csv (set to None to disable validation)
+config.val_csv = None

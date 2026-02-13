@@ -85,6 +85,18 @@ def main(args):
         cfg.num_workers,
     )
 
+    val_loader = None
+    if cfg.val_csv:
+        val_loader, _, _ = get_tripletdataloader(
+            cfg.val_csv,
+            cfg.basedir,
+            args.local_rank,
+            cfg.batch_size,
+            cfg.dali,
+            cfg.seed,
+            cfg.num_workers,
+        )
+
     backbone = get_model(
         cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
 
@@ -205,9 +217,26 @@ def main(args):
             }
             torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
 
-        if rank == 0:
+        if rank == 0 and (epoch + 1) % 4 == 0:
             path_module = os.path.join(cfg.output, f"model_{epoch+1}.pt")
             torch.save(backbone.module.state_dict(), path_module)
+
+        # Validation loss
+        if val_loader is not None:
+            backbone.eval()
+            val_loss_am = AverageMeter()
+            with torch.no_grad():
+                for _, (img, _, img_pos, img_neg) in enumerate(val_loader):
+                    local_embeddings = backbone(torch.cat([img, img_pos, img_neg], 0))
+                    emb_anc = local_embeddings[:len(img)]
+                    emb_pos = local_embeddings[len(img):len(img)*2]
+                    emb_neg = local_embeddings[len(img)*2:len(img)*3]
+                    val_loss = fc(emb_anc, emb_pos, emb_neg)
+                    val_loss_am.update(val_loss.item(), 1)
+            backbone.train()
+            if rank == 0 and summary_writer is not None:
+                summary_writer.add_scalar('val_loss', val_loss_am.avg, global_step)
+                logging.info(f"Epoch {epoch+1} validation loss: {val_loss_am.avg:.4f}")
 
         if cfg.dali:
             train_loader.reset()

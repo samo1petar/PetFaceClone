@@ -14,7 +14,7 @@ config.sample_rate = 1.0
 config.fp16 = True
 config.momentum = 0.9
 config.weight_decay = 5e-4
-config.batch_size = 384
+config.batch_size = 256
 config.lr = 0.1
 config.verbose = 2000
 config.dali = False
@@ -26,3 +26,4 @@ config.warmup_epoch = 0
 
 
 config.train_csv = 'data/PetFace/split/dog/train.csv'
+config.val_csv = 'data/PetFace/split/dog/val.csv'
