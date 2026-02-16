@@ -3,41 +3,60 @@ import logging
 import os
 import shutil
 import json
+import math
 
-import numpy as np
 import torch
-from torch import distributed
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.functional import linear, normalize
 
 from backbones import get_model
-from dataset import get_dataloader
+from dataset import Train
 from losses import CombinedMarginLoss
 from lr_scheduler import PolyScheduler
 from torch.optim.lr_scheduler import StepLR
-from partial_fc import PartialFC, PartialFCAdamW
-from utils.utils_callbacks import CallBackLogging, CallBackVerification
+from utils.utils_callbacks import CallBackLogging
 from utils.utils_config import get_config
 from utils.utils_logging import AverageMeter, init_logging
 from utils.utils_distributed_sampler import setup_seed
-import math
 
-# assert torch.__version__ >= "1.9.0", "In order to enjoy the features of the new torch, \
-# we have upgraded the torch to 1.9.0. torch before than 1.9.0 may not work in the future."
 
-try:
-    world_size = int(os.environ["WORLD_SIZE"])
-    rank = int(os.environ["RANK"])
-    distributed.init_process_group("nccl")
-except KeyError:
-    world_size = 1
-    rank = 0
-    distributed.init_process_group(
-        backend="nccl",
-        init_method="tcp://127.0.0.1:12584",
-        rank=rank,
-        world_size=world_size,
+class ArcFaceHead(torch.nn.Module):
+    """Single-GPU replacement for PartialFC with sample_rate=1.0."""
+
+    def __init__(self, margin_loss, embedding_size, num_classes, fp16=False):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.normal(0, 0.01, (num_classes, embedding_size)))
+        self.margin_softmax = margin_loss
+        self.fp16 = fp16
+        self.ce = torch.nn.CrossEntropyLoss()
+
+    def forward(self, embeddings, labels):
+        labels = labels.squeeze().long()
+        with torch.amp.autocast('cuda', enabled=self.fp16):
+            norm_embeddings = normalize(embeddings)
+            norm_weight = normalize(self.weight)
+            logits = linear(norm_embeddings, norm_weight)
+        if self.fp16:
+            logits = logits.float()
+        logits = logits.clamp(-1, 1)
+        logits = self.margin_softmax(logits, labels.view(-1, 1))
+        loss = self.ce(logits, labels)
+        return loss
+
+
+def make_dataloader(csv_path, basedir, batch_size, num_workers, shuffle=True):
+    dataset = Train(train_csv=csv_path, basedir=basedir, local_rank=0)
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
     )
+    return loader, dataset.num_classes, len(dataset)
 
 
 def main(args):
@@ -49,33 +68,26 @@ def main(args):
     # global control random seed
     setup_seed(seed=cfg.seed, cuda_deterministic=False)
 
-    torch.cuda.set_device(args.local_rank)
+    torch.cuda.set_device(0)
 
     os.makedirs(cfg.output, exist_ok=True)
-    init_logging(rank, cfg.output)
+    init_logging(0, cfg.output)
 
-    # Save config file and args for reproducibility (only on rank 0)
-    if rank == 0:
-        shutil.copy(args.config, os.path.join(cfg.output, os.path.basename(args.config)))
-        with open(os.path.join(cfg.output, "args.json"), "w") as f:
-            json.dump(vars(args), f, indent=4)
+    # Save config file and args for reproducibility
+    shutil.copy(args.config, os.path.join(cfg.output, os.path.basename(args.config)))
+    with open(os.path.join(cfg.output, "args.json"), "w") as f:
+        json.dump(vars(args), f, indent=4)
 
-    summary_writer = (
-        SummaryWriter(log_dir=os.path.join(cfg.output, "tensorboard"))
-        if rank == 0
-        else None
-    )
-    print('device count:', torch.cuda.device_count())
+    summary_writer = SummaryWriter(log_dir=os.path.join(cfg.output, "tensorboard"))
+
     print('batch_size:', cfg.batch_size)
-    train_loader,num_classes,num_image = get_dataloader(
-        cfg.train_csv,
-        cfg.basedir,
-        args.local_rank,
-        cfg.batch_size,
-        cfg.dali,
-        cfg.seed,
-        cfg.num_workers
-    )
+    train_loader, num_classes, num_image = make_dataloader(
+        cfg.train_csv, cfg.basedir, cfg.batch_size, cfg.num_workers, shuffle=True)
+
+    val_loader = None
+    if cfg.val_csv:
+        val_loader, _, _ = make_dataloader(
+            cfg.val_csv, cfg.basedir, cfg.batch_size, cfg.num_workers, shuffle=False)
 
     if args.network is not None:
         cfg.network=args.network
@@ -83,13 +95,7 @@ def main(args):
     backbone = get_model(
         cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
 
-    backbone = torch.nn.parallel.DistributedDataParallel(
-        module=backbone, broadcast_buffers=False, device_ids=[args.local_rank], bucket_cap_mb=16,
-        find_unused_parameters=True)
-
     backbone.train()
-    # FIXME using gradient checkpoint if there are some unused parameters will cause error
-    backbone._set_static_graph()
 
     margin_loss = CombinedMarginLoss(
         (2**(1/2))*(math.log(num_classes-1)),
@@ -99,28 +105,22 @@ def main(args):
         cfg.interclass_filtering_threshold
     )
 
-    if cfg.optimizer == "sgd":
-        module_partial_fc = PartialFC(
-            margin_loss, cfg.embedding_size, num_classes,
-            cfg.sample_rate, cfg.fp16)
-        module_partial_fc.train().cuda()
-        # TODO the params of partial fc must be last in the params list
-        opt = torch.optim.SGD(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
-            lr=cfg.lr, momentum=0.9, weight_decay=cfg.weight_decay)
+    module_fc = ArcFaceHead(
+        margin_loss, cfg.embedding_size, num_classes, cfg.fp16)
+    module_fc.train().cuda()
 
+    if cfg.optimizer == "sgd":
+        opt = torch.optim.SGD(
+            params=[{"params": backbone.parameters()}, {"params": module_fc.parameters()}],
+            lr=cfg.lr, momentum=0.9, weight_decay=cfg.weight_decay)
     elif cfg.optimizer == "adamw":
-        module_partial_fc = PartialFCAdamW(
-            margin_loss, cfg.embedding_size, num_classes,
-            cfg.sample_rate, cfg.fp16)
-        module_partial_fc.train().cuda()
         opt = torch.optim.AdamW(
-            params=[{"params": backbone.parameters()}, {"params": module_partial_fc.parameters()}],
+            params=[{"params": backbone.parameters()}, {"params": module_fc.parameters()}],
             lr=cfg.lr, weight_decay=cfg.weight_decay)
     else:
         raise
 
-    cfg.total_batch_size = cfg.batch_size * world_size
+    cfg.total_batch_size = cfg.batch_size
     cfg.warmup_step = num_image // cfg.total_batch_size * cfg.warmup_epoch
     cfg.total_step = num_image // cfg.total_batch_size * cfg.num_epoch
 
@@ -139,15 +139,14 @@ def main(args):
     start_epoch = 0
     global_step = 0
     if cfg.resume:
-        dict_checkpoint = torch.load(os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"), weights_only=False)
+        dict_checkpoint = torch.load(os.path.join(cfg.output, "checkpoint.pt"), weights_only=False)
         start_epoch = dict_checkpoint["epoch"]
         global_step = dict_checkpoint["global_step"]
-        backbone.module.load_state_dict(dict_checkpoint["state_dict_backbone"])
-        module_partial_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
+        backbone.load_state_dict(dict_checkpoint["state_dict_backbone"])
+        module_fc.load_state_dict(dict_checkpoint["state_dict_softmax_fc"])
         opt.load_state_dict(dict_checkpoint["state_optimizer"])
         lr_scheduler.load_state_dict(dict_checkpoint["state_lr_scheduler"])
         if "state_step_lr_scheduler" in dict_checkpoint:
-            # Recreate StepLR scheduler and load its state
             step_lr_scheduler = StepLR(
                 optimizer=opt,
                 step_size=cfg.step_size,
@@ -161,15 +160,14 @@ def main(args):
         num_space = 25 - len(key)
         logging.info(": " + key + " " * num_space + str(value))
 
-    # callback_verification = CallBackVerification(
-    #     val_targets=cfg.val_targets, rec_prefix=cfg.rec, summary_writer=summary_writer
-    # )
     callback_logging = CallBackLogging(
         frequent=cfg.frequent,
         total_step=cfg.total_step,
         batch_size=cfg.batch_size,
-        start_step = global_step,
-        writer=summary_writer
+        start_step=global_step,
+        writer=summary_writer,
+        rank=0,
+        world_size=1,
     )
 
     loss_am = AverageMeter()
@@ -180,16 +178,13 @@ def main(args):
         # Initialize StepLR scheduler when switching from PolyScheduler
         use_step_lr = cfg.step_lr_after_epoch and epoch >= cfg.step_lr_after_epoch
         if use_step_lr and not step_lr_initialized:
-            # Determine starting LR based on config
             if cfg.step_lr_start == "initial":
                 start_lr = cfg.lr
             elif cfg.step_lr_start == "current":
                 start_lr = opt.param_groups[0]['lr']
             else:
-                # Assume it's a float value
                 start_lr = float(cfg.step_lr_start)
 
-            # Set optimizer LR before creating StepLR
             for param_group in opt.param_groups:
                 param_group['lr'] = start_lr
 
@@ -201,12 +196,13 @@ def main(args):
             step_lr_initialized = True
             logging.info(f"Switched to StepLR at epoch {epoch} with starting LR: {start_lr}")
 
-        if isinstance(train_loader, DataLoader):
-            train_loader.sampler.set_epoch(epoch)
         for _, (img, local_labels) in enumerate(train_loader):
             global_step += 1
+            img = img.cuda(non_blocking=True)
+            local_labels = local_labels.cuda(non_blocking=True)
+
             local_embeddings = backbone(img)
-            loss: torch.Tensor = module_partial_fc(local_embeddings, local_labels, opt)
+            loss: torch.Tensor = module_fc(local_embeddings, local_labels)
             opt.zero_grad()
 
             if cfg.fp16:
@@ -229,9 +225,6 @@ def main(args):
                 loss_am.update(loss.item(), 1)
                 callback_logging(global_step, loss_am, epoch, cfg.fp16, current_lr, amp)
 
-                # if global_step % cfg.verbose == 0 and global_step > 0:
-                #     callback_verification(global_step, backbone)
-
         # Step the StepLR scheduler at the end of each epoch (if active)
         if use_step_lr and step_lr_scheduler is not None:
             step_lr_scheduler.step()
@@ -240,46 +233,46 @@ def main(args):
             checkpoint = {
                 "epoch": epoch + 1,
                 "global_step": global_step,
-                "state_dict_backbone": backbone.module.state_dict(),
-                "state_dict_softmax_fc": module_partial_fc.state_dict(),
+                "state_dict_backbone": backbone.state_dict(),
+                "state_dict_softmax_fc": module_fc.state_dict(),
                 "state_optimizer": opt.state_dict(),
                 "state_lr_scheduler": lr_scheduler.state_dict()
             }
             if step_lr_scheduler is not None:
                 checkpoint["state_step_lr_scheduler"] = step_lr_scheduler.state_dict()
-            torch.save(checkpoint, os.path.join(cfg.output, f"checkpoint_gpu_{rank}.pt"))
+            torch.save(checkpoint, os.path.join(cfg.output, "checkpoint.pt"))
 
-        if False:#rank == 0 and (epoch+1)%20==0:
+        if (epoch + 1) % 4 == 0:
             path_module = os.path.join(cfg.output, f"model_{epoch+1}.pt")
-            torch.save(backbone.module.state_dict(), path_module)
+            torch.save(backbone.state_dict(), path_module)
 
-        if cfg.dali:
-            train_loader.reset()
+        # Validation loss
+        if val_loader is not None:
+            backbone.eval()
+            val_loss_am = AverageMeter()
+            with torch.no_grad():
+                for _, (img, local_labels) in enumerate(val_loader):
+                    img = img.cuda(non_blocking=True)
+                    local_labels = local_labels.cuda(non_blocking=True)
+                    local_embeddings = backbone(img)
+                    val_loss = module_fc(local_embeddings, local_labels)
+                    val_loss_am.update(val_loss.item(), 1)
+            backbone.train()
+            summary_writer.add_scalar('val_loss', val_loss_am.avg, global_step)
+            logging.info(f"Epoch {epoch+1} validation loss: {val_loss_am.avg:.4f}")
 
-    if rank == 0:
-        path_module = os.path.join(cfg.output, "model_last.pt")
-        checkpoint = {
-                # "epoch": epoch + 1,
-                # "global_step": global_step,
-                "state_dict_backbone": backbone.module.state_dict(),
-                "state_dict_softmax_fc": module_partial_fc.state_dict(),
-                # "state_optimizer": opt.state_dict(),
-                # "state_lr_scheduler": lr_scheduler.state_dict()
-            }
-        # torch.save(backbone.module.state_dict(), path_module)
-        torch.save(checkpoint, path_module)
-
-        # from torch2onnx import convert_onnx
-        # convert_onnx(backbone.module.cpu().eval(), path_module, os.path.join(cfg.output, "model.onnx"))
-    distributed.destroy_process_group()
+    path_module = os.path.join(cfg.output, "model_last.pt")
+    checkpoint = {
+        "state_dict_backbone": backbone.state_dict(),
+        "state_dict_softmax_fc": module_fc.state_dict(),
+    }
+    torch.save(checkpoint, path_module)
 
 
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
-    parser = argparse.ArgumentParser(
-        description="Distributed Arcface Training in Pytorch")
+    parser = argparse.ArgumentParser(description="ArcFace Training in Pytorch")
     parser.add_argument("config", type=str, help="py config file")
-    parser.add_argument("--local_rank", type=int, default=0, help="local_rank")
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--network", type=str, default=None)
     main(parser.parse_args())
