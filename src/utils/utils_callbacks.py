@@ -58,10 +58,10 @@ class CallBackVerification(object):
 
 
 class CallBackLogging(object):
-    def __init__(self, frequent, total_step, batch_size, start_step=0,writer=None):
+    def __init__(self, frequent, total_step, batch_size, start_step=0,writer=None, rank=None, world_size=None):
         self.frequent: int = frequent
-        self.rank: int = distributed.get_rank()
-        self.world_size: int = distributed.get_world_size()
+        self.rank: int = rank if rank is not None else distributed.get_rank()
+        self.world_size: int = world_size if world_size is not None else distributed.get_world_size()
         self.time_start = time.time()
         self.total_step: int = total_step
         self.start_step: int = start_step
