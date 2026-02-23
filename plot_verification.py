@@ -1,14 +1,17 @@
+import argparse
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import roc_curve, auc, accuracy_score
 
-# Load results
+parser = argparse.ArgumentParser()
+parser.add_argument('--results_dir', type=str, required=True, help='Directory to save output plot')
+parser.add_argument('--csv', type=str, required=True, help='Path to verification results CSV')
+args = parser.parse_args()
 
-results_dir = 'outputs/christy_dogs_dog2_original_model_2'
-
-df = pd.read_csv(os.path.join(results_dir, 'verification_results.csv'))
+results_dir = args.results_dir
+df = pd.read_csv(args.csv)
 
 # Separate by label
 positive = df[df['label'] == 1]['sim']
@@ -47,7 +50,8 @@ ax3.set_ylabel('Cosine Similarity')
 ax3.set_title('Similarity by Category')
 
 plt.tight_layout()
-plt.savefig(os.path.join(results_dir, 'verification_plot.png'), dpi=150)
+plot_name = os.path.splitext(os.path.basename(args.csv))[0] + '_plot.png'
+plt.savefig(os.path.join(results_dir, plot_name), dpi=150)
 plt.show()
 
 # Print statistics
@@ -79,4 +83,4 @@ predictions_05 = (df['sim'] >= 0.5).astype(int)
 acc_05 = accuracy_score(df['label'], predictions_05)
 print(f"Accuracy at threshold 0.5: {acc_05:.4f}")
 
-print(f"\nPlot saved to: {results_dir}/verification_plot.png")
+print(f"\nPlot saved to: {os.path.join(results_dir, plot_name)}")
