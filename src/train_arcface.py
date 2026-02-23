@@ -90,8 +90,8 @@ def main(args):
             cfg.val_csv, cfg.basedir, cfg.batch_size, cfg.num_workers, shuffle=False)
 
     if args.network is not None:
-        cfg.network=args.network
-        
+        cfg.network = args.network
+
     backbone = get_model(
         cfg.network, dropout=0.0, fp16=cfg.fp16, num_features=cfg.embedding_size).cuda()
 
